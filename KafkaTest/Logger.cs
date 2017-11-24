@@ -72,7 +72,7 @@ namespace KafkaTest
         {
             if (args != null && args.Length > 0)
                 message = string.Format(message, args);
-            var logMessage = $"INFO {Name}: {message}";
+            var logMessage = $"INFO  {Name}: {message}";
             this.WriteLog(logMessage);
         }
 

@@ -32,11 +32,31 @@ namespace KafkaTest
     {
         public Dictionary<string, object> ConsumerConfig;
         public Dictionary<string, object> ProducerConfig;
+        public Logger Log;
 
-        public Kafka(Dictionary<string, object> consumerConfig, Dictionary<string, object> producerConfig)
+        public Kafka(Dictionary<string, object> consumerConfig, Dictionary<string, object> producerConfig, Logger log)
         {
             ConsumerConfig = consumerConfig;
             ProducerConfig = producerConfig;
+            Log = log;
+        }
+
+        public Consumer<Null, byte[]> GetConsumer()
+        {
+            // Add extra config in an effort to make this thing consume messages. Grrrrr.
+            // ConsumerConfig["group.id"] = Guid.NewGuid();
+            ConsumerConfig["group.id"] = "dotnet_speed_test";
+            ConsumerConfig["enable.auto.commit"] = true;
+            ConsumerConfig["default.topic.config"] = new Dictionary<string, object>()
+            {
+                { "auto.offset.reset", "smallest" }
+            };
+            return new Consumer<Null, byte[]>(ConsumerConfig, new NullDeserializer(), new DoNothingSerializer());
+        }
+
+        public Producer<Null, byte[]> GetProducer()
+        {
+            return new Producer<Null, byte[]>(ProducerConfig, new NullSerializer(), new DoNothingSerializer());
         }
 
         public void SendMessages(List<byte[]> messages, string topic)
@@ -63,7 +83,7 @@ namespace KafkaTest
                     }
                     if (sw.ElapsedMilliseconds > 30000)
                     {
-                        Console.WriteLine("Waited longer than 30 seconds for a kafka message to send");
+                        Log.WriteLogError("Waited longer than 30 seconds for a kafka message to send");
                         throw new TimeoutException("Waited longer than 30 seconds for a kafka message to send");
                     }
                     System.Threading.Thread.Sleep(50);
@@ -98,7 +118,7 @@ namespace KafkaTest
                 };
                 consumer.OnPartitionEOF += (_, end) =>
                 {
-                    Console.WriteLine($"End of topic partition reached.");
+                    Log.WriteLogInfo($"End of topic partition reached.");
                     keepGoing = false;
                 };
                 consumer.OnPartitionsAssigned += (_, partitions) =>
@@ -107,26 +127,26 @@ namespace KafkaTest
                     if (!string.IsNullOrEmpty(assignedParts))
                     {
                         consumer.Assign(partitions);
-                        Console.WriteLine($"Partitions assigned: {assignedParts}");
+                        Log.WriteLogInfo($"Partitions assigned: {assignedParts}");
                     }
                     else
                     {
-                        Console.WriteLine($"Partitions was null or empty. Continuing to poll.");
+                        Log.WriteLogInfo($"Partitions was null or empty. Continuing to poll.");
                     }
                 };
                 consumer.OnError += (_, error) =>
                 {
-                    Console.WriteLine(error.ToString());
+                    Log.WriteLogError(error.ToString());
                 };
                 consumer.OnConsumeError += (_, error) =>
                 {
-                    Console.WriteLine(error.ToString());
+                    Log.WriteLogError(error.ToString());
                 };
 
                 consumer.Subscribe(new List<string> { topic });
                 while (output.Count < numExpected)
                 {
-                    consumer.Poll(1000);
+                    consumer.Poll(100);
                     Thread.Sleep(100);
                     if (!keepGoing)
                     {
