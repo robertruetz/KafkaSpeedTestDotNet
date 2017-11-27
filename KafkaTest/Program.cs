@@ -243,6 +243,7 @@ namespace KafkaTest
 
         static void Main(string[] args)
         {
+            System.Threading.ThreadPool.SetMinThreads(50, 30);
             var globalSw = new Stopwatch();
             var taskSw = new Stopwatch();
             var topic = "speed_test_dotnet";
@@ -268,10 +269,16 @@ namespace KafkaTest
             }
             #endregion parseCommandLineArgs
 
-            var serializer = new AvroSerializer(User._SCHEMA); 
+            var serializer = new AvroSerializer(User._SCHEMA);
+            var brokers = System.Environment.GetEnvironmentVariable("KAFKA_BROKERS");
+            if (string.IsNullOrEmpty(brokers))
+            {
+                GlobalLogger.WriteLogError("KAFKA_BROKERS env var not set.");
+                Environment.Exit(2);
+            }
             var config = new Dictionary<string, object>()
                 {
-                    {"bootstrap.servers", "ruetz-brkr1.dev-ruetz.service.consul:10086"}
+                    {"bootstrap.servers", brokers}
                 };
             var kafka = new Kafka(config, config, GlobalLogger);
 
