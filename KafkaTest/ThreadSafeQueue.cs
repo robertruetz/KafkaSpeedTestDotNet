@@ -14,6 +14,15 @@ namespace KafkaTest
             _usingResource = 0;
         }
 
+        public void ClearQueue()
+        {
+            if (0 == Interlocked.Exchange(ref _usingResource, 1))
+            {
+                _queue.Clear();
+                Interlocked.Exchange(ref _usingResource, 0);
+            }
+        }
+
         public void Enqueue(T data)
         {
             if (0 == Interlocked.Exchange(ref _usingResource, 1))

@@ -28,17 +28,56 @@ namespace KafkaTest
         }
     }
 
-    class Kafka
+    class Kafka : IDisposable
     {
         public Dictionary<string, object> ConsumerConfig;
         public Dictionary<string, object> ProducerConfig;
+        public Producer<Null, byte[]> Prod;
+        public Consumer<Null, byte[]> Cons;
+        public ThreadSafeQueue<byte[]> ReceivedBytes;
+        public ThreadSafeQueue<byte[]> ToProduceBytes;
+        public ThreadSafeQueue<User> UserQueue;
         public Logger Log;
+        public bool ConsumerAssigned = false;
+        public int MessagesRead = 0;
 
         public Kafka(Dictionary<string, object> consumerConfig, Dictionary<string, object> producerConfig, Logger log)
         {
             ConsumerConfig = consumerConfig;
             ProducerConfig = producerConfig;
             Log = log;
+            Prod = new Producer<Null, byte[]>(ProducerConfig, new NullSerializer(), new DoNothingSerializer());
+            Cons = new Consumer<Null, byte[]>(ConsumerConfig, new NullDeserializer(), new DoNothingSerializer());
+            Cons.OnMessage += (_, message) =>
+            {
+                ReceivedBytes.Enqueue(message.Value);
+                MessagesRead++;
+            };
+            Cons.OnPartitionsAssigned += (_, partitions) =>
+            {
+                var assignedParts = string.Join(", ", partitions);
+                if (!string.IsNullOrEmpty(assignedParts))
+                {
+                    Cons.Assign(partitions);
+                    ConsumerAssigned = true;
+                    Log.WriteLogInfo($"Partitions assigned: {assignedParts}");
+                }
+                else
+                {
+                    Log.WriteLogInfo($"Partitions was null or empty. Continuing to poll.");
+                }
+            };
+            Cons.OnError += (_, error) =>
+            {
+                Log.WriteLogError(error.ToString());
+            };
+            Cons.OnConsumeError += (_, error) =>
+            {
+                Log.WriteLogError(error.ToString());
+            };
+            ReceivedBytes = new ThreadSafeQueue<byte[]>();
+            ToProduceBytes = new ThreadSafeQueue<byte[]>();
+            UserQueue = new ThreadSafeQueue<User>();
         }
 
         public Consumer<Null, byte[]> GetConsumer()
@@ -57,6 +96,37 @@ namespace KafkaTest
         public Producer<Null, byte[]> GetProducer()
         {
             return new Producer<Null, byte[]>(ProducerConfig, new NullSerializer(), new DoNothingSerializer());
+        }
+
+        public void ProduceMessages(List<byte[]> messages, string topic)
+        {
+            List<Task<Message<Null, byte[]>>> taskList = new List<Task<Message<Null, byte[]>>>();
+            foreach (byte[] message in messages)
+            {
+                taskList.Add(Prod.ProduceAsync(topic, null, message));//TODO configurable message send timeout    
+            }
+            var messagesSent = 0;
+            var sw = new Stopwatch();
+            sw.Start();
+            while (taskList.Count > 0)
+            {
+                for (int i = 0; i < taskList.Count; i++)
+                {
+                    if (taskList[i].Status == TaskStatus.RanToCompletion)
+                    {
+                        messagesSent++;
+                        taskList.Remove(taskList[i]);
+                    }
+                }
+                if (sw.ElapsedMilliseconds > 30000)
+                {
+                    Log.WriteLogError("Waited longer than 30 seconds for a kafka message to send");
+                    throw new TimeoutException("Waited longer than 30 seconds for a kafka message to send");
+                }
+                Thread.Sleep(100);
+            }
+            sw.Stop();
+            Prod.Flush(0);
         }
 
         public void SendMessages(List<byte[]> messages, string topic)
@@ -156,6 +226,14 @@ namespace KafkaTest
             }
             return output;
         }
-        
+
+        public void Dispose()
+        {
+            Log.WriteLogInfo("Disposing of Kafka.");
+            this.Prod.Dispose();
+            this.Cons.Dispose();
+            Prod = null;
+            Cons = null;
+        }
     }
 }
