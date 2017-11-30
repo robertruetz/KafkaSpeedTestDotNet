@@ -284,9 +284,10 @@ namespace KafkaTest
                            while (count < num)
                            {
                                var payload = DateTime.UtcNow.ToLongDateString();
-                               producer.ProduceAsync(topic, null, Encoding.ASCII.GetBytes(payload));
+                               var deliveryReport = producer.ProduceAsync(topic, null, Encoding.ASCII.GetBytes(payload));
                                count++;
                            }
+                           producer.Flush(TimeSpan.FromSeconds(10));
                        }
                    }).Wait();
                 
@@ -330,7 +331,7 @@ namespace KafkaTest
                     
                         consumer.OnMessage += (_, message) =>
                         {
-                            // GlobalLogger.WriteLogDebug($"Message received. That makes {messagesRead}.");
+                            GlobalLogger.WriteLogDebug($"Message received. That makes {messagesRead}.");
                             messagesRead++;
                         };
                         consumer.OnPartitionEOF += (_, partition) =>
@@ -345,7 +346,7 @@ namespace KafkaTest
                             {
                                 var offsets = consumer.QueryWatermarkOffsets(part, TimeSpan.FromMilliseconds(1000));
                                 GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
-                                assignments.Add(new TopicPartitionOffset(part, offsets.Low));
+                                assignments.Add(new TopicPartitionOffset(part, offsets.High));
                             }
                             consumer.Assign(assignments.ToArray());
                             //consumer.Assign(partitions);
