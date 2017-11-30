@@ -127,7 +127,6 @@ namespace KafkaTest
         public override void Run()
         {
             var sw = new Stopwatch();
-            var numRead = 0;
             _startSignal.WaitOne();
             sw.Start();
 
@@ -254,7 +253,12 @@ namespace KafkaTest
             }
             var producerConfig = new Dictionary<string, object>()
             {
-                {"bootstrap.servers", brokers}
+                {"bootstrap.servers", brokers},
+                {"group.id", "dotnet_speed_test"},
+                {"client.id", Environment.MachineName},
+                {"acks", "all"},
+                {"compression.codec", "gzip"},
+                {"message.max.bytes", 500 * 1048576}
             };
             var consumerConfig = new Dictionary<string, object>()
             {
@@ -270,14 +274,6 @@ namespace KafkaTest
                     }
                 }
             };
-            var cfg = new Dictionary<string, object>();
-            cfg.Add("bootstrap.servers", brokers);
-            cfg.Add("group.id", "dotnet_speed_test");
-            cfg.Add("client.id", Environment.MachineName);
-            cfg.Add("acks", "all");
-            cfg.Add("compression.codec", "gzip");
-            cfg.Add("message.max.bytes", 500 * 1048576);
-            //cfgTopic.Add( "max.message.bytes", txfrCfg.MaxMsgSizeMB * 1048576 );
 
             var prodSw = new Stopwatch();
             if (load)
@@ -287,17 +283,18 @@ namespace KafkaTest
                 var count = 0;
                 prodSw.Start();
 
-                using (var producer = new Producer(cfg))
+                using (var producer = new Producer(producerConfig))
                 {
                     Task.Run(() =>
                     {
                         while (count < num)
                         {
-                            producer.ProduceAsync(topic, null, Encoding.ASCII.GetBytes(DateTime.UtcNow.ToLongDateString()));
+                            var deliveryReport = producer.ProduceAsync(topic, null, Encoding.ASCII.GetBytes(DateTime.UtcNow.ToLongDateString()));
                             count++;
                         }
                         producer.Flush(TimeSpan.FromSeconds(10));
                     }).Wait(); 
+                    // TODO: Add delivery callback. Consider sending in batches, checking returns to make sure no errors occurred. 
                 }
                 prodSw.Stop();
                 GlobalLogger.WriteLogInfo($"Done producing.");
@@ -324,13 +321,16 @@ namespace KafkaTest
                         GlobalLogger.WriteLogInfo($"Assigned partitions: [{string.Join(", ", partitions)}]");
                         var offsets = consumer.QueryWatermarkOffsets(partitions[0]);
                         GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
+
                         //List<TopicPartitionOffset> assignments = new List<TopicPartitionOffset>();
                         //foreach (var part in partitions)
                         //{
                         //    var offsets = consumer.QueryWatermarkOffsets(part, TimeSpan.FromMilliseconds(1000));
-                        //    assignments.Add(new TopicPartitionOffset(part, offsets.High));
+                        //    GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
+                        //    assignments.Add(new TopicPartitionOffset(part, 11005290));
                         //}
                         //consumer.Assign(assignments.ToArray());
+
                         consumer.Assign(partitions);
                         assigned = true;
                     };
