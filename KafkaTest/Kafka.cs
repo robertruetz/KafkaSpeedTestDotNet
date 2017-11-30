@@ -103,7 +103,7 @@ namespace KafkaTest
             List<Task<Message<Null, byte[]>>> taskList = new List<Task<Message<Null, byte[]>>>();
             foreach (byte[] message in messages)
             {
-                taskList.Add(Prod.ProduceAsync(topic, null, message));//TODO configurable message send timeout    
+                taskList.Add(Prod.ProduceAsync(topic, null, message));//TODO configurable message send timeout
             }
             var messagesSent = 0;
             var sw = new Stopwatch();
