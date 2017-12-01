@@ -56,17 +56,17 @@ namespace KafkaTest
 
     class KafkaWriteTask : ThreadedTaskWorker
     {
-        public Kafka KafkaConnection;
+        public Dictionary<string, object> ProducerConfig;
         public Logger Log;
         public string Topic;
         public int BatchSize;
         public int NumExpected;
 
-        public KafkaWriteTask(ILogger logger, CountdownEvent countdownEvent, Kafka kafka, string topic, int batchSize, int numExpected)
+        public KafkaWriteTask(ILogger logger, CountdownEvent countdownEvent, Dictionary<string, object> producerConfig, string topic, int batchSize, int numExpected)
             : base(logger, countdownEvent)
         {
             Log = logger as Logger;
-            KafkaConnection = kafka;
+            ProducerConfig = producerConfig;
             Topic = topic;
             BatchSize = batchSize;
             NumExpected = numExpected;
@@ -76,34 +76,26 @@ namespace KafkaTest
         {
             _startSignal.WaitOne();
             var sw = new Stopwatch();
-            var numDone = 0;
+            var count = 0.0;
+
+            Log.WriteLogInfo($"Producing {NumExpected} messages to topic {Topic}");
             sw.Start();
-            while(_running)
+            using (var producer = new Producer(ProducerConfig))
             {
-                var msgs = new List<byte[]>();
-                while (KafkaConnection.ToProduceBytes.TryDequeue(out byte[] msg))
+                Task.Run(() =>
                 {
-                    msgs.Add(msg);
-                    numDone++;
-                    if (numDone >= NumExpected)
+                    while (count < NumExpected)
                     {
-                        _running = false;
+                        var deliveryReport = producer.ProduceAsync(Topic, null, Encoding.ASCII.GetBytes(DateTime.UtcNow.ToLongDateString()));
+                        count++;
                     }
-                    if (msgs.Count >= BatchSize)
-                    {
-                        break;
-                    }
-                }
-                if (msgs.Count > 0)
-                {
-                    KafkaConnection.ProduceMessages(msgs, Topic);
-                    msgs.Clear();
-                }
-                _startSignal.WaitOne();
-                Thread.Sleep(100);
+                    producer.Flush(TimeSpan.FromSeconds(10));
+                }).Wait();
+                // TODO: Add delivery callback. Consider sending in batches, checking returns to make sure no errors occurred. 
             }
             sw.Stop();
-            Log.WriteLogInfo($"{numDone} messages written to Kafka in {sw.ElapsedMilliseconds} ms.");
+            var msgPerMs =  sw.ElapsedMilliseconds / count;
+            Log.WriteLogInfo($"{count} messages written to Kafka in {sw.ElapsedMilliseconds} ms. Rate: {msgPerMs} msgs/ms");
             _countdownEvent.Signal();
         }
     }
@@ -111,14 +103,14 @@ namespace KafkaTest
     class KafkaReadThread : ThreadedTaskWorker
     {
         public Logger Log;
-        public Kafka KafkaConnection;
+        public Dictionary<string, object> ConsumerConfig;
         public string Topic;
         public int NumExpected;
 
-        public KafkaReadThread(ILogger logger, CountdownEvent countDownEvent, Kafka kafka, string topic, int numExpected) 
+        public KafkaReadThread(ILogger logger, CountdownEvent countDownEvent, Dictionary<string, object> consumerConfig, string topic, int numExpected) 
             : base(logger, countDownEvent)
         {
-            KafkaConnection = kafka;
+            ConsumerConfig = consumerConfig;
             Topic = topic;
             NumExpected = numExpected;
             Log = logger as Logger;
@@ -127,26 +119,75 @@ namespace KafkaTest
         public override void Run()
         {
             var sw = new Stopwatch();
-            _startSignal.WaitOne();
-            sw.Start();
+            var messagesRead = 0;
+            var assigned = false;
 
-            while (_running)
+            _startSignal.WaitOne();
+
+            using (var consumer = new Consumer(ConsumerConfig))
             {
-                KafkaConnection.Cons.Poll(100);
-                if (NumExpected == 0)
+                consumer.OnMessage += (_, message) =>
                 {
-                    // We're just warming up. Keep looping.
-                    continue;
-                }
-                else if (KafkaConnection.MessagesRead >= NumExpected)
+                    // GlobalLogger.WriteLogDebug($"Message received. That makes {messagesRead}.");
+                    messagesRead++;
+                };
+                consumer.OnPartitionEOF += (_, partition) =>
                 {
                     _running = false;
+                };
+                consumer.OnPartitionsAssigned += (_, partitions) =>
+                {
+                    Log.WriteLogInfo($"Assigned partitions: [{string.Join(", ", partitions)}]");
+                    var offsets = consumer.QueryWatermarkOffsets(partitions[0]);
+                    Log.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
+
+                    //List<TopicPartitionOffset> assignments = new List<TopicPartitionOffset>();
+                    //foreach (var part in partitions)
+                    //{
+                    //    var offsets = consumer.QueryWatermarkOffsets(part, TimeSpan.FromMilliseconds(1000));
+                    //    GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
+                    //    assignments.Add(new TopicPartitionOffset(part, 11005290));
+                    //}
+                    //consumer.Assign(assignments.ToArray());
+
+                    consumer.Assign(partitions);
+                    assigned = true;
+                };
+                consumer.OnError += (_, error) =>
+                {
+                    Log.WriteLogError(error.Reason);
+                };
+                consumer.OnConsumeError += (_, error) =>
+                {
+                    Log.WriteLogError(error.Error.Reason);
+                };
+
+                sw.Start();
+                consumer.Subscribe(new List<string> { Topic });
+                while(!assigned)
+                {
+                    consumer.Poll(100);
+                    Thread.Sleep(100);
                 }
-                _startSignal.WaitOne();
-                Thread.Sleep(100);
+                sw.Stop();
+                Log.WriteLogInfo($"Consumer assigned in {sw.ElapsedMilliseconds} ms.");
+
+                sw.Reset();
+                sw.Start();
+                while (_running)
+                {
+                    consumer.Poll(1000);
+                    if (messagesRead >= NumExpected)
+                    {
+                        _running = false;
+                    }
+                    _startSignal.WaitOne();
+                    Thread.Sleep(100);
+                }
             }
             sw.Stop();
-            Log.WriteLogInfo($"{KafkaConnection.MessagesRead} messages read in {sw.ElapsedMilliseconds} ms.");
+            var msgsPerMs = sw.ElapsedMilliseconds / messagesRead;
+            Log.WriteLogInfo($"{messagesRead} messages read in {sw.ElapsedMilliseconds} ms. Rate: {msgsPerMs} msgs/ms");
             _countdownEvent.Signal();
         }
     }
@@ -243,7 +284,7 @@ namespace KafkaTest
             var serializer = new AvroSerializer(User._SCHEMA);
             var brokers = System.Environment.GetEnvironmentVariable("KAFKA_BROKERS");
 #if DEBUG
-            brokers = "104.198.16.33:10086";
+            brokers = "35.193.239.63:10086";
 #endif
 
             if (string.IsNullOrEmpty(brokers))
@@ -279,94 +320,45 @@ namespace KafkaTest
             if (load)
             {
                 topic = "load_test_dotnet";
-                GlobalLogger.WriteLogInfo($"Producing {num} messages to topic {topic}");
-                var count = 0;
-                prodSw.Start();
-
-                using (var producer = new Producer(producerConfig))
-                {
-                    Task.Run(() =>
+                var countDown = new CountdownEvent(1);
+                var taskList = new List<ThreadedTaskWorker>()
                     {
-                        while (count < num)
+                        new KafkaWriteTask(GlobalLogger, countDown, producerConfig, topic, 100, num),
+                        new KafkaReadThread(GlobalLogger, countDown, consumerConfig, topic, num),
+                    };
+                var threads = new List<Thread>();
+                Console.CancelKeyPress += (sender, eventArgs) =>
+                {
+                    GlobalLogger.WriteLogInfo("Stopping tasks.");
+                    foreach (var task in taskList)
+                    {
+                        task.Stop();
+                    }
+                    foreach (var thr in threads)
+                    {
+                        thr.Join(2000);
+                        if (thr.ThreadState == System.Threading.ThreadState.Running)
                         {
-                            var deliveryReport = producer.ProduceAsync(topic, null, Encoding.ASCII.GetBytes(DateTime.UtcNow.ToLongDateString()));
-                            count++;
+                            thr.Abort();
                         }
-                        producer.Flush(TimeSpan.FromSeconds(10));
-                    }).Wait(); 
-                    // TODO: Add delivery callback. Consider sending in batches, checking returns to make sure no errors occurred. 
-                }
-                prodSw.Stop();
-                GlobalLogger.WriteLogInfo($"Done producing.");
-                var msgPerSec = count / prodSw.ElapsedMilliseconds;
-                GlobalLogger.WriteLogInfo($"{count} messages produced in {prodSw.ElapsedMilliseconds} ms. Rate: {msgPerSec} msgs/ms.");
+                    }
+                };
 
-                using (var consumer = new Consumer(consumerConfig))
+                prodSw.Start();
+                foreach (var task in taskList)
                 {
-                    var keepGoing = true;
-                    var assigned = false;
-                    var messagesRead = 0;
-
-                    consumer.OnMessage += (_, message) =>
-                    {
-                        // GlobalLogger.WriteLogDebug($"Message received. That makes {messagesRead}.");
-                        messagesRead++;
-                    };
-                    consumer.OnPartitionEOF += (_, partition) =>
-                    {
-                        keepGoing = false;
-                    };
-                    consumer.OnPartitionsAssigned += (_, partitions) =>
-                    {
-                        GlobalLogger.WriteLogInfo($"Assigned partitions: [{string.Join(", ", partitions)}]");
-                        var offsets = consumer.QueryWatermarkOffsets(partitions[0]);
-                        GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
-
-                        //List<TopicPartitionOffset> assignments = new List<TopicPartitionOffset>();
-                        //foreach (var part in partitions)
-                        //{
-                        //    var offsets = consumer.QueryWatermarkOffsets(part, TimeSpan.FromMilliseconds(1000));
-                        //    GlobalLogger.WriteLogDebug($"offsets -- High: {offsets.High}, Low: {offsets.Low}");
-                        //    assignments.Add(new TopicPartitionOffset(part, 11005290));
-                        //}
-                        //consumer.Assign(assignments.ToArray());
-
-                        consumer.Assign(partitions);
-                        assigned = true;
-                    };
-                    consumer.OnError += (_, error) =>
-                    {
-                        GlobalLogger.WriteLogError(error.Reason);
-                    };
-                    consumer.OnConsumeError += (_, error) =>
-                    {
-                        GlobalLogger.WriteLogError(error.Error.Reason);
-                    };
-
-                    consumer.Subscribe(new List<string> { topic });
-                    GlobalLogger.WriteLogInfo("Waiting for topic assignment.");
-                    while (!assigned)
-                    {
-                        consumer.Poll(100);
-                        Thread.Sleep(100);
-                    }
-                    Thread.Sleep(1000);
-
-                    prodSw.Reset();
-                    prodSw.Start();
-                    while (keepGoing)
-                    {
-                        consumer.Poll(100);
-                        Thread.Sleep(100);
-                    }
-                    prodSw.Stop();
-                    if (messagesRead == 0)
-                    {
-                        GlobalLogger.WriteLogError($"{messagesRead} messages read. Something's broken.");
-                        return;
-                    }
-                    GlobalLogger.WriteLogInfo($"{messagesRead} messages consumed in {prodSw.ElapsedMilliseconds} ms. Rate {prodSw.ElapsedMilliseconds / messagesRead} msgs/ms.");
+                    countDown.AddCount();
+                    var nThread = new Thread(task.Run);
+                    nThread.IsBackground = true;
+                    threads.Add(nThread);
+                    nThread.Start();
+                    task.Start();
                 }
+                countDown.Signal();
+                countDown.Wait();
+
+                prodSw.Stop();
+                GlobalLogger.WriteLogInfo($"Total script time: {prodSw.ElapsedMilliseconds} ms");
                 GlobalLogger.WriteLogInfo("Done.");
                 return;
             }
@@ -397,64 +389,12 @@ namespace KafkaTest
 
                 globalSw.Start();
                 GlobalLogger.WriteLogInfo($"Starting test pass with {num} messages.");
-                if (multithreaded)
-                {
-                    var userQueue = new ThreadSafeQueue<User>();
-                    var serializedQueue = new ThreadSafeQueue<byte[]>();
-                    var deserializedQueue = new ThreadSafeQueue<User>();
-
-                    var countDown = new CountdownEvent(1);
-
-                    var taskList = new List<ThreadedTaskWorker>()
-                    {
-                        new AvroSerializerTask(GlobalLogger, countDown, userQueue, kafka, num),
-                        new KafkaWriteTask(GlobalLogger, countDown, kafka, topic, 100, num),
-                        new KafkaReadThread(GlobalLogger, countDown, kafka, topic, num),
-                        new AvroDeserializeTask(GlobalLogger, countDown, kafka, deserializedQueue, serializer, num)
-                    };
-                    var threads = new List<Thread>();
-                    Console.CancelKeyPress += (sender, eventArgs) =>
-                    {
-                        GlobalLogger.WriteLogInfo("Stopping tasks.");
-                        foreach (var task in taskList)
-                        {
-                            task.Stop();
-                        }
-                        foreach (var thr in threads)
-                        {
-                            thr.Join(2000);
-                            if (thr.ThreadState == System.Threading.ThreadState.Running)
-                            {
-                                thr.Abort();
-                            }
-                        }
-                    };
-                    foreach (var task in taskList)
-                    {
-                        countDown.AddCount();
-                        var nThread = new Thread(task.Run);
-                        nThread.IsBackground = true;
-                        threads.Add(nThread);
-                        nThread.Start();
-                        task.Start();
-                    }
-                    countDown.Signal();
-                    var rand = new Random();
-
-                    for (int i = 0; i < num; i++)
-                    {
-                        userQueue.Enqueue(new User(GetRandomString(10), rand.Next(100), GetRandomColor()));
-                    }
-                    countDown.Wait();
-                }
-                else
-                {
-                    var users = CreateUserList(num, GlobalLogger, ref taskSw);
-                    var msgs = AvroSerializeMessages(users, serializer, GlobalLogger, ref taskSw);
-                    SendMessagesToKafka(kafka, msgs, topic, GlobalLogger, ref taskSw);
-                    var received = ReadMessagesFromKafka(kafka, topic, num, GlobalLogger, ref taskSw);
-                    var deserialized = AvroDeserializeMessages(received, serializer, GlobalLogger, ref taskSw);
-                } 
+                
+                var users = CreateUserList(num, GlobalLogger, ref taskSw);
+                var msgs = AvroSerializeMessages(users, serializer, GlobalLogger, ref taskSw);
+                SendMessagesToKafka(kafka, msgs, topic, GlobalLogger, ref taskSw);
+                var received = ReadMessagesFromKafka(kafka, topic, num, GlobalLogger, ref taskSw);
+                var deserialized = AvroDeserializeMessages(received, serializer, GlobalLogger, ref taskSw);
             }
             globalSw.Stop();
             GlobalLogger.WriteLogInfo($"Script run time: {globalSw.ElapsedMilliseconds} ms.");
